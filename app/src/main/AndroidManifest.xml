@@ -5,15 +5,13 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
-        android:maxSdkVersion="29" />
+        android:maxSdkVersion="28" />
 
     <application
-        android:name=".BlackHoleApplication"
         android:allowBackup="true"
         android:extractNativeLibs="true"
         android:icon="@drawable/black_hole"
         android:label="BLACK HOLE"
-        android:requestLegacyExternalStorage="true"
         android:roundIcon="@drawable/black_hole"
         android:supportsRtl="true"
         android:theme="@style/Theme.BlackHole">

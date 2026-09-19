@@ -2,25 +2,19 @@ package com.blackhole.downloader;
 
 import android.Manifest;
 import android.app.Activity;
+import android.app.DownloadManager;
 import android.content.ClipData;
 import android.content.ClipboardManager;
-import android.content.ContentResolver;
-import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.database.Cursor;
 import android.graphics.Color;
-import android.media.MediaCodec;
-import android.media.MediaExtractor;
-import android.media.MediaFormat;
-import android.media.MediaMuxer;
-import android.media.MediaScannerConnection;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.Handler;
 import android.os.Looper;
-import android.provider.MediaStore;
 import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
@@ -30,56 +24,37 @@ import android.widget.FrameLayout;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import com.yausername.youtubedl_android.YoutubeDL;
-import com.yausername.youtubedl_android.YoutubeDLRequest;
-import com.yausername.youtubedl_android.mapper.VideoInfo;
-
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
+import java.io.BufferedReader;
 import java.io.InputStream;
-import java.io.OutputStream;
+import java.io.InputStreamReader;
+import java.net.HttpURLConnection;
 import java.net.URI;
-import java.nio.ByteBuffer;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import kotlin.Unit;
-import kotlin.jvm.functions.Function3;
-
 public class MainActivity extends Activity {
     private static final int STORAGE_PERMISSION_REQUEST = 41;
     private static final Pattern URL_PATTERN = Pattern.compile("https?://[^\\s]+", Pattern.CASE_INSENSITIVE);
+    private static final int MAX_HTML_CHARS = 4_000_000;
 
-    // Prefer the highest MP4 video and M4A audio that Android can merge natively.
-    // This keeps the APK much smaller than bundling a full FFmpeg binary.
-    private static final String VIDEO_FORMAT =
-            "bestvideo[ext=mp4][vcodec^=avc1]/bestvideo[ext=mp4]";
-    private static final String AUDIO_FORMAT =
-            "bestaudio[ext=m4a][acodec^=mp4a]/bestaudio[ext=m4a]";
-    private static final String COMBINED_FORMAT =
-            "best[ext=mp4][vcodec!=none][acodec!=none]/best[ext=mp4]";
-
-    private final ExecutorService downloadExecutor = Executors.newSingleThreadExecutor();
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final ExecutorService worker = Executors.newSingleThreadExecutor();
 
     private BlackHoleView blackHoleView;
     private ClipboardManager clipboardManager;
     private ClipboardManager.OnPrimaryClipChangedListener clipboardListener;
     private String currentUrl;
-    private boolean downloading = false;
+    private boolean busy;
     private String pendingPermissionUrl;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-
-        // IMPORTANT: no downloader/native library is initialized here.
-        // The UI opens first on every supported device; extractor setup only starts after a tap.
         configureJetBlackWindow();
         buildHomeScreen();
 
@@ -87,12 +62,8 @@ public class MainActivity extends Activity {
         clipboardListener = this::detectClipboardLink;
 
         String shared = extractUrlFromText(getIntent().getStringExtra(Intent.EXTRA_TEXT));
-        if (shared != null) {
-            currentUrl = shared;
-            blackHoleView.setMode(BlackHoleView.Mode.READY);
-        } else {
-            detectClipboardLink();
-        }
+        if (shared != null) setDetectedUrl(shared);
+        else detectClipboardLink();
     }
 
     private void configureJetBlackWindow() {
@@ -105,18 +76,15 @@ public class MainActivity extends Activity {
             window.setDecorFitsSystemWindows(false);
             WindowInsetsController controller = window.getInsetsController();
             if (controller != null) {
-                controller.setSystemBarsAppearance(
-                        0,
+                controller.setSystemBarsAppearance(0,
                         WindowInsetsController.APPEARANCE_LIGHT_STATUS_BARS |
-                                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS
-                );
+                                WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS);
             }
         } else {
             window.getDecorView().setSystemUiVisibility(
                     View.SYSTEM_UI_FLAG_LAYOUT_STABLE |
                             View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN |
-                            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-            );
+                            View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         }
     }
 
@@ -127,8 +95,7 @@ public class MainActivity extends Activity {
         blackHoleView = new BlackHoleView(this);
         root.addView(blackHoleView, new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.MATCH_PARENT
-        ));
+                FrameLayout.LayoutParams.MATCH_PARENT));
 
         TextView history = new TextView(this);
         history.setText("HISTORY");
@@ -140,16 +107,15 @@ public class MainActivity extends Activity {
         history.setBackgroundColor(Color.TRANSPARENT);
         history.setOnClickListener(v -> startActivity(new Intent(this, HistoryActivity.class)));
 
-        FrameLayout.LayoutParams historyParams = new FrameLayout.LayoutParams(
+        FrameLayout.LayoutParams hp = new FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT
-        );
-        historyParams.gravity = Gravity.BOTTOM | Gravity.END;
-        historyParams.setMargins(0, 0, dp(16), dp(22));
-        root.addView(history, historyParams);
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        hp.gravity = Gravity.BOTTOM | Gravity.END;
+        hp.setMargins(0, 0, dp(16), dp(22));
+        root.addView(history, hp);
 
         blackHoleView.setOnClickListener(v -> {
-            if (!downloading) beginFromCurrentLink();
+            if (!busy) beginFromCurrentLink();
         });
 
         setContentView(root);
@@ -161,7 +127,7 @@ public class MainActivity extends Activity {
         if (clipboardManager != null && clipboardListener != null) {
             clipboardManager.addPrimaryClipChangedListener(clipboardListener);
         }
-        if (!downloading) detectClipboardLink();
+        if (!busy) detectClipboardLink();
     }
 
     @Override
@@ -173,20 +139,22 @@ public class MainActivity extends Activity {
     }
 
     private void detectClipboardLink() {
-        if (downloading || clipboardManager == null || !clipboardManager.hasPrimaryClip()) return;
+        if (busy || clipboardManager == null || !clipboardManager.hasPrimaryClip()) return;
         try {
             ClipData clip = clipboardManager.getPrimaryClip();
             if (clip == null || clip.getItemCount() == 0) return;
             CharSequence text = clip.getItemAt(0).coerceToText(this);
             String url = extractUrlFromText(text == null ? null : text.toString());
-            if (url != null) {
-                currentUrl = url;
-                blackHoleView.hideStatus();
-                blackHoleView.setMode(BlackHoleView.Mode.READY);
-            }
+            if (url != null) setDetectedUrl(url);
         } catch (Throwable ignored) {
-            // Some Android versions restrict clipboard access. Share-to-BLACK-HOLE still works.
+            // Share-to-BLACK-HOLE remains available if a vendor ROM restricts clipboard reads.
         }
+    }
+
+    private void setDetectedUrl(String url) {
+        currentUrl = url;
+        blackHoleView.hideStatus();
+        blackHoleView.setMode(BlackHoleView.Mode.READY);
     }
 
     private void beginFromCurrentLink() {
@@ -196,7 +164,6 @@ public class MainActivity extends Activity {
             return;
         }
 
-        // Only Android 9 needs legacy write permission. Android 10+ uses MediaStore.
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P &&
                 checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
             pendingPermissionUrl = currentUrl;
@@ -204,375 +171,231 @@ public class MainActivity extends Activity {
             return;
         }
 
-        startDownload(currentUrl);
+        resolveAndDownload(currentUrl);
     }
 
-    private void startDownload(String url) {
-        downloading = true;
+    private void resolveAndDownload(String pageUrl) {
+        busy = true;
         blackHoleView.setMode(BlackHoleView.Mode.PROCESSING);
-        blackHoleView.showStatus("ANALYZING VIDEO", sourceName(url), 0f);
+        blackHoleView.showStatus("ANALYZING VIDEO", sourceName(pageUrl), 2f);
 
-        downloadExecutor.execute(() -> {
-            File workDir = null;
+        worker.execute(() -> {
             try {
-                // Init is intentionally deferred until the user actually downloads.
-                YoutubeDL.getInstance().init(getApplicationContext());
-
-                workDir = createWorkDirectory();
-                String title = "Video";
-                String resolution = "Highest available";
-
-                try {
-                    YoutubeDLRequest infoRequest = new YoutubeDLRequest(url);
-                    infoRequest.addOption("--no-playlist");
-                    infoRequest.addOption("-f", VIDEO_FORMAT);
-                    VideoInfo info = YoutubeDL.getInstance().getInfo(infoRequest);
-                    if (info != null) {
-                        if (info.getTitle() != null && !info.getTitle().trim().isEmpty()) {
-                            title = info.getTitle().trim();
-                        }
-                        if (info.getResolution() != null && !info.getResolution().trim().isEmpty()) {
-                            resolution = info.getResolution().trim();
-                        } else if (info.getHeight() > 0) {
-                            resolution = info.getHeight() + "p";
-                        }
-                    }
-                } catch (Throwable ignored) {
-                    // Metadata is optional; download can still continue.
+                ResolvedMedia media = resolveMedia(pageUrl);
+                if (media == null || media.url == null) {
+                    throw new IllegalStateException("No public video stream was found");
                 }
-
-                final String displayResolution = resolution;
-                runOnUiThread(() -> {
-                    blackHoleView.setMode(BlackHoleView.Mode.DOWNLOADING);
-                    blackHoleView.showStatus("DOWNLOADING", displayResolution, 1f);
-                });
-
-                File finalVideo;
-                try {
-                    finalVideo = downloadAndNativeMux(url, workDir, displayResolution);
-                } catch (Throwable highQualityError) {
-                    // If a site does not expose separate MP4/M4A streams, use its best combined MP4.
-                    finalVideo = downloadCombinedFallback(url, workDir, displayResolution);
-                }
-
-                if (finalVideo == null || !finalVideo.exists() || finalVideo.length() <= 0) {
-                    throw new IOException("Downloaded file was not created");
-                }
-
-                runOnUiThread(() -> blackHoleView.showStatus(
-                        "SAVING VIDEO", displayResolution + " • 96%", 96f
-                ));
-
-                String outputName = makeOutputName(title);
-                publishVideo(finalVideo, outputName);
-
-                HistoryStore.add(this, new HistoryStore.Entry(
-                        title,
-                        sourceName(url),
-                        displayResolution,
-                        System.currentTimeMillis()
-                ));
-
-                runOnUiThread(this::showSuccess);
+                runOnUiThread(() -> startSystemDownload(media, pageUrl));
             } catch (Throwable error) {
                 runOnUiThread(() -> showFailure(error));
-            } finally {
-                if (workDir != null) deleteRecursively(workDir);
             }
         });
     }
 
-    private File downloadAndNativeMux(String url, File workDir, String resolution) throws Exception {
-        File videoFile = new File(workDir, "video.mp4");
-        File audioFile = new File(workDir, "audio.m4a");
-        File mergedFile = new File(workDir, "merged.mp4");
-
-        YoutubeDLRequest videoRequest = new YoutubeDLRequest(url);
-        videoRequest.addOption("--no-playlist");
-        videoRequest.addOption("--no-mtime");
-        videoRequest.addOption("--no-part");
-        videoRequest.addOption("-f", VIDEO_FORMAT);
-        videoRequest.addOption("-o", videoFile.getAbsolutePath());
-
-        Function3<Float, Long, String, Unit> videoCallback = (progress, eta, line) -> {
-            float p = progress == null ? 0f : Math.max(0f, Math.min(100f, progress));
-            float overall = 2f + p * 0.68f;
-            runOnUiThread(() -> blackHoleView.showStatus(
-                    "DOWNLOADING VIDEO", resolution + " • " + Math.round(overall) + "%", overall
-            ));
-            return Unit.INSTANCE;
-        };
-        YoutubeDL.getInstance().execute(videoRequest, "bh-video-" + System.nanoTime(), videoCallback);
-
-        if (!videoFile.exists() || videoFile.length() == 0) {
-            throw new IOException("High-quality video stream unavailable");
+    private ResolvedMedia resolveMedia(String inputUrl) throws Exception {
+        if (looksLikeDirectMedia(inputUrl)) {
+            return new ResolvedMedia(inputUrl, fileNameFromUrl(inputUrl), "Direct video");
         }
 
-        YoutubeDLRequest audioRequest = new YoutubeDLRequest(url);
-        audioRequest.addOption("--no-playlist");
-        audioRequest.addOption("--no-mtime");
-        audioRequest.addOption("--no-part");
-        audioRequest.addOption("-f", AUDIO_FORMAT);
-        audioRequest.addOption("-o", audioFile.getAbsolutePath());
-
-        Function3<Float, Long, String, Unit> audioCallback = (progress, eta, line) -> {
-            float p = progress == null ? 0f : Math.max(0f, Math.min(100f, progress));
-            float overall = 70f + p * 0.16f;
-            runOnUiThread(() -> blackHoleView.showStatus(
-                    "DOWNLOADING AUDIO", resolution + " • " + Math.round(overall) + "%", overall
-            ));
-            return Unit.INSTANCE;
-        };
-        YoutubeDL.getInstance().execute(audioRequest, "bh-audio-" + System.nanoTime(), audioCallback);
-
-        if (!audioFile.exists() || audioFile.length() == 0) {
-            throw new IOException("Audio stream unavailable");
+        HttpURLConnection connection = open(inputUrl);
+        int code = connection.getResponseCode();
+        if (code < 200 || code >= 400) {
+            throw new IllegalStateException("Source returned HTTP " + code);
         }
 
-        runOnUiThread(() -> blackHoleView.showStatus(
-                "MERGING", resolution + " • 88%", 88f
-        ));
-
-        muxMp4(videoFile, audioFile, mergedFile);
-        if (!mergedFile.exists() || mergedFile.length() == 0) {
-            throw new IOException("Could not merge video and audio");
+        String finalUrl = connection.getURL().toString();
+        String contentType = connection.getContentType();
+        if (contentType != null && contentType.toLowerCase(Locale.ROOT).startsWith("video/")) {
+            connection.disconnect();
+            return new ResolvedMedia(finalUrl, fileNameFromUrl(finalUrl), contentType);
         }
-        return mergedFile;
-    }
 
-    private File downloadCombinedFallback(String url, File workDir, String resolution) throws Exception {
-        File combined = new File(workDir, "combined.mp4");
-        if (combined.exists()) combined.delete();
-
-        runOnUiThread(() -> blackHoleView.showStatus(
-                "DOWNLOADING", resolution + " • compatible mode", 4f
-        ));
-
-        YoutubeDLRequest request = new YoutubeDLRequest(url);
-        request.addOption("--no-playlist");
-        request.addOption("--no-mtime");
-        request.addOption("--no-part");
-        request.addOption("-f", COMBINED_FORMAT);
-        request.addOption("-o", combined.getAbsolutePath());
-
-        Function3<Float, Long, String, Unit> callback = (progress, eta, line) -> {
-            float p = progress == null ? 0f : Math.max(0f, Math.min(100f, progress));
-            float overall = 5f + p * 0.88f;
-            runOnUiThread(() -> blackHoleView.showStatus(
-                    "DOWNLOADING", resolution + " • " + Math.round(overall) + "%", overall
-            ));
-            return Unit.INSTANCE;
-        };
-
-        YoutubeDL.getInstance().execute(request, "bh-combined-" + System.nanoTime(), callback);
-        if (!combined.exists() || combined.length() == 0) {
-            throw new IOException("No compatible MP4 stream found");
-        }
-        return combined;
-    }
-
-    private void muxMp4(File videoFile, File audioFile, File outputFile) throws IOException {
-        MediaExtractor videoExtractor = new MediaExtractor();
-        MediaExtractor audioExtractor = new MediaExtractor();
-        MediaMuxer muxer = null;
-        boolean muxerStarted = false;
-
-        try {
-            videoExtractor.setDataSource(videoFile.getAbsolutePath());
-            audioExtractor.setDataSource(audioFile.getAbsolutePath());
-
-            int videoTrack = findTrack(videoExtractor, "video/");
-            int audioTrack = findTrack(audioExtractor, "audio/");
-            if (videoTrack < 0 || audioTrack < 0) {
-                throw new IOException("Required media tracks not found");
-            }
-
-            MediaFormat videoFormat = videoExtractor.getTrackFormat(videoTrack);
-            MediaFormat audioFormat = audioExtractor.getTrackFormat(audioTrack);
-
-            if (outputFile.exists()) outputFile.delete();
-            muxer = new MediaMuxer(outputFile.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
-            int muxVideoTrack = muxer.addTrack(videoFormat);
-            int muxAudioTrack = muxer.addTrack(audioFormat);
-            muxer.start();
-            muxerStarted = true;
-
-            copyTrack(videoExtractor, videoTrack, muxer, muxVideoTrack);
-            copyTrack(audioExtractor, audioTrack, muxer, muxAudioTrack);
+        String html;
+        try (InputStream stream = connection.getInputStream()) {
+            html = readLimited(stream);
         } finally {
-            try {
-                if (muxer != null && muxerStarted) muxer.stop();
-            } catch (Throwable ignored) {
+            connection.disconnect();
+        }
+
+        String mediaUrl = firstMatch(html,
+                "(?is)<meta[^>]+(?:property|name)=[\\\"']og:video(?::url|:secure_url)?[\\\"'][^>]+content=[\\\"']([^\\\"']+)",
+                "(?is)<meta[^>]+content=[\\\"']([^\\\"']+)[\\\"'][^>]+(?:property|name)=[\\\"']og:video(?::url|:secure_url)?[\\\"']",
+                "(?is)\\\"contentUrl\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
+                "(?is)\\\"playAddr\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
+                "(?is)\\\"downloadAddr\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"",
+                "(?is)\\\"video_url\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+
+        mediaUrl = decodeEscapedUrl(mediaUrl);
+        if (mediaUrl == null || !mediaUrl.startsWith("http")) {
+            throw new IllegalStateException("This source needs server extraction");
+        }
+
+        return new ResolvedMedia(mediaUrl, fileNameFromUrl(mediaUrl), "Best public stream");
+    }
+
+    private HttpURLConnection open(String value) throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(value).openConnection();
+        c.setInstanceFollowRedirects(true);
+        c.setConnectTimeout(15_000);
+        c.setReadTimeout(20_000);
+        c.setRequestProperty("User-Agent",
+                "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36");
+        c.setRequestProperty("Accept", "text/html,application/xhtml+xml,application/json,video/*;q=0.9,*/*;q=0.8");
+        c.setRequestProperty("Accept-Language", "en-US,en;q=0.8");
+        return c;
+    }
+
+    private String readLimited(InputStream input) throws Exception {
+        StringBuilder out = new StringBuilder();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(input, StandardCharsets.UTF_8))) {
+            char[] buffer = new char[8192];
+            int read;
+            while ((read = reader.read(buffer)) != -1 && out.length() < MAX_HTML_CHARS) {
+                int allowed = Math.min(read, MAX_HTML_CHARS - out.length());
+                out.append(buffer, 0, allowed);
             }
-            try {
-                if (muxer != null) muxer.release();
-            } catch (Throwable ignored) {
-            }
-            videoExtractor.release();
-            audioExtractor.release();
+        }
+        return out.toString();
+    }
+
+    private String firstMatch(String text, String... patterns) {
+        if (text == null) return null;
+        for (String pattern : patterns) {
+            Matcher matcher = Pattern.compile(pattern).matcher(text);
+            if (matcher.find()) return matcher.group(1);
+        }
+        return null;
+    }
+
+    private String decodeEscapedUrl(String value) {
+        if (value == null) return null;
+        String v = value
+                .replace("\\u0026", "&")
+                .replace("\\u002F", "/")
+                .replace("\\/", "/")
+                .replace("&amp;", "&")
+                .replace("&#38;", "&");
+        return v.trim();
+    }
+
+    private void startSystemDownload(ResolvedMedia media, String sourcePage) {
+        try {
+            DownloadManager manager = (DownloadManager) getSystemService(DOWNLOAD_SERVICE);
+            if (manager == null) throw new IllegalStateException("Download service unavailable");
+
+            String fileName = sanitizeFileName(media.fileName);
+            if (!hasVideoExtension(fileName)) fileName += ".mp4";
+
+            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(media.url));
+            request.setTitle("BLACK HOLE");
+            request.setDescription("Downloading video");
+            request.setAllowedNetworkTypes(DownloadManager.Request.NETWORK_WIFI | DownloadManager.Request.NETWORK_MOBILE);
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, "BLACK HOLE/" + fileName);
+            request.addRequestHeader("User-Agent",
+                    "Mozilla/5.0 (Linux; Android 16) AppleWebKit/537.36 Chrome/140.0 Mobile Safari/537.36");
+
+            long id = manager.enqueue(request);
+            blackHoleView.setMode(BlackHoleView.Mode.DOWNLOADING);
+            blackHoleView.showStatus("DOWNLOADING", media.label, 4f);
+            monitorDownload(manager, id, sourcePage, media.label);
+        } catch (Throwable error) {
+            showFailure(error);
         }
     }
 
-    private int findTrack(MediaExtractor extractor, String mimePrefix) {
-        for (int i = 0; i < extractor.getTrackCount(); i++) {
-            MediaFormat format = extractor.getTrackFormat(i);
-            String mime = format.getString(MediaFormat.KEY_MIME);
-            if (mime != null && mime.startsWith(mimePrefix)) return i;
-        }
-        return -1;
-    }
+    private void monitorDownload(DownloadManager manager, long id, String sourcePage, String label) {
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (isFinishing()) return;
+                try (Cursor cursor = manager.query(new DownloadManager.Query().setFilterById(id))) {
+                    if (cursor == null || !cursor.moveToFirst()) {
+                        showFailure(new IllegalStateException("Download disappeared"));
+                        return;
+                    }
 
-    private void copyTrack(MediaExtractor extractor, int sourceTrack, MediaMuxer muxer, int targetTrack)
-            throws IOException {
-        extractor.selectTrack(sourceTrack);
-        ByteBuffer buffer = ByteBuffer.allocateDirect(8 * 1024 * 1024);
-        MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+                    int status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS));
+                    long total = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_TOTAL_SIZE_BYTES));
+                    long done = cursor.getLong(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_BYTES_DOWNLOADED_SO_FAR));
+                    int percent = total > 0 ? (int) Math.max(4, Math.min(99, done * 100L / total)) : 18;
 
-        while (true) {
-            buffer.clear();
-            int sampleSize = extractor.readSampleData(buffer, 0);
-            if (sampleSize < 0) break;
+                    if (status == DownloadManager.STATUS_SUCCESSFUL) {
+                        HistoryStore.add(MainActivity.this, new HistoryStore.Entry(
+                                "Video", sourceName(sourcePage), label, System.currentTimeMillis()));
+                        showSuccess();
+                        return;
+                    }
+                    if (status == DownloadManager.STATUS_FAILED) {
+                        int reason = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_REASON));
+                        showFailure(new IllegalStateException("Download failed (" + reason + ")"));
+                        return;
+                    }
 
-            long sampleTime = extractor.getSampleTime();
-            if (sampleTime < 0) break;
-
-            info.offset = 0;
-            info.size = sampleSize;
-            info.presentationTimeUs = sampleTime;
-            info.flags = extractor.getSampleFlags();
-            muxer.writeSampleData(targetTrack, buffer, info);
-            extractor.advance();
-        }
-        extractor.unselectTrack(sourceTrack);
-    }
-
-    private File createWorkDirectory() throws IOException {
-        File base = getExternalFilesDir(Environment.DIRECTORY_MOVIES);
-        if (base == null) base = getCacheDir();
-        File dir = new File(base, "black-hole-" + System.currentTimeMillis());
-        if (!dir.mkdirs() && !dir.isDirectory()) {
-            throw new IOException("Could not create temporary folder");
-        }
-        return dir;
-    }
-
-    private void publishVideo(File source, String displayName) throws IOException {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            ContentResolver resolver = getContentResolver();
-            ContentValues values = new ContentValues();
-            values.put(MediaStore.MediaColumns.DISPLAY_NAME, displayName);
-            values.put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4");
-            values.put(MediaStore.MediaColumns.RELATIVE_PATH,
-                    Environment.DIRECTORY_DOWNLOADS + "/BLACK HOLE");
-            values.put(MediaStore.MediaColumns.IS_PENDING, 1);
-
-            Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-            if (uri == null) throw new IOException("Could not create Downloads entry");
-
-            boolean success = false;
-            try (InputStream input = new FileInputStream(source);
-                 OutputStream output = resolver.openOutputStream(uri)) {
-                if (output == null) throw new IOException("Could not open Downloads output");
-                copy(input, output);
-                success = true;
-            } finally {
-                if (success) {
-                    ContentValues done = new ContentValues();
-                    done.put(MediaStore.MediaColumns.IS_PENDING, 0);
-                    resolver.update(uri, done, null, null);
-                } else {
-                    resolver.delete(uri, null, null);
+                    blackHoleView.showStatus("DOWNLOADING", label + " • " + percent + "%", percent);
+                    mainHandler.postDelayed(this, 650L);
+                } catch (Throwable error) {
+                    showFailure(error);
                 }
             }
-        } else {
-            File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
-            File folder = new File(downloads, "BLACK HOLE");
-            if (!folder.exists() && !folder.mkdirs()) {
-                throw new IOException("Could not create Downloads/BLACK HOLE");
-            }
-            File destination = uniqueFile(folder, displayName);
-            try (InputStream input = new FileInputStream(source);
-                 OutputStream output = new FileOutputStream(destination)) {
-                copy(input, output);
-            }
-            MediaScannerConnection.scanFile(
-                    this,
-                    new String[]{destination.getAbsolutePath()},
-                    new String[]{"video/mp4"},
-                    null
-            );
-        }
-    }
-
-    private void copy(InputStream input, OutputStream output) throws IOException {
-        byte[] buffer = new byte[256 * 1024];
-        int read;
-        while ((read = input.read(buffer)) != -1) {
-            output.write(buffer, 0, read);
-        }
-        output.flush();
-    }
-
-    private File uniqueFile(File folder, String name) {
-        File candidate = new File(folder, name);
-        if (!candidate.exists()) return candidate;
-
-        String base = name.toLowerCase(Locale.ROOT).endsWith(".mp4")
-                ? name.substring(0, name.length() - 4)
-                : name;
-        int i = 2;
-        while (candidate.exists()) {
-            candidate = new File(folder, base + " (" + i + ").mp4");
-            i++;
-        }
-        return candidate;
-    }
-
-    private String makeOutputName(String title) {
-        String safe = title == null ? "Video" : title.trim();
-        safe = safe.replaceAll("[\\\\/:*?\"<>|\\p{Cntrl}]", "_");
-        safe = safe.replaceAll("\\s+", " ").trim();
-        if (safe.isEmpty()) safe = "Video";
-        if (safe.length() > 90) safe = safe.substring(0, 90).trim();
-        return safe + ".mp4";
-    }
-
-    private void deleteRecursively(File file) {
-        if (file == null || !file.exists()) return;
-        if (file.isDirectory()) {
-            File[] children = file.listFiles();
-            if (children != null) {
-                for (File child : children) deleteRecursively(child);
-            }
-        }
-        try {
-            file.delete();
-        } catch (Throwable ignored) {
-        }
+        }, 500L);
     }
 
     private void showSuccess() {
-        downloading = false;
+        busy = false;
         blackHoleView.setMode(BlackHoleView.Mode.SUCCESS);
         blackHoleView.showStatus("DOWNLOAD COMPLETE", "Saved to Downloads / BLACK HOLE", 100f);
         mainHandler.postDelayed(() -> {
             if (!isFinishing()) {
                 blackHoleView.hideStatus();
-                blackHoleView.setMode(currentUrl != null ? BlackHoleView.Mode.READY : BlackHoleView.Mode.IDLE);
+                blackHoleView.setMode(currentUrl == null ? BlackHoleView.Mode.IDLE : BlackHoleView.Mode.READY);
             }
-        }, 3200L);
+        }, 3000L);
     }
 
     private void showFailure(Throwable error) {
-        downloading = false;
+        busy = false;
         blackHoleView.setMode(BlackHoleView.Mode.ERROR);
-        blackHoleView.showStatus("DOWNLOAD FAILED", friendlyError(error), -1f);
+        String message = error == null ? "Try another public video link" : error.getMessage();
+        if (message == null || message.trim().isEmpty()) message = "Try another public video link";
+        if (message.contains("server extraction")) {
+            message = "This source needs the online extractor";
+        }
+        blackHoleView.showStatus("DOWNLOAD FAILED", message, -1f);
         mainHandler.postDelayed(() -> {
             if (!isFinishing()) {
                 blackHoleView.hideStatus();
-                blackHoleView.setMode(currentUrl != null ? BlackHoleView.Mode.READY : BlackHoleView.Mode.IDLE);
+                blackHoleView.setMode(currentUrl == null ? BlackHoleView.Mode.IDLE : BlackHoleView.Mode.READY);
             }
-        }, 4200L);
+        }, 3800L);
+    }
+
+    private boolean looksLikeDirectMedia(String url) {
+        String value = url.toLowerCase(Locale.ROOT);
+        return value.contains(".mp4") || value.contains(".webm") || value.contains(".m4v") ||
+                value.contains(".mov") || value.contains(".3gp") || value.contains(".m3u8");
+    }
+
+    private boolean hasVideoExtension(String fileName) {
+        String value = fileName.toLowerCase(Locale.ROOT);
+        return value.endsWith(".mp4") || value.endsWith(".webm") || value.endsWith(".m4v") ||
+                value.endsWith(".mov") || value.endsWith(".3gp");
+    }
+
+    private String fileNameFromUrl(String value) {
+        try {
+            String path = Uri.parse(value).getLastPathSegment();
+            if (path != null && !path.trim().isEmpty() && path.length() < 120) return path;
+        } catch (Throwable ignored) {
+        }
+        return "black-hole-" + System.currentTimeMillis() + ".mp4";
+    }
+
+    private String sanitizeFileName(String value) {
+        if (value == null || value.trim().isEmpty()) value = "black-hole-" + System.currentTimeMillis();
+        value = value.replaceAll("[\\\\/:*?\\\"<>|]", "_");
+        if (value.length() > 100) value = value.substring(0, 100);
+        return value;
     }
 
     private String sourceName(String url) {
@@ -587,23 +410,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    private String friendlyError(Throwable error) {
-        String message = error == null ? null : error.getMessage();
-        if (message == null || message.trim().isEmpty()) {
-            return "Try another supported public video link";
-        }
-        String lower = message.toLowerCase(Locale.ROOT);
-        if (lower.contains("unsupported url")) return "This link is not supported yet";
-        if (lower.contains("private") || lower.contains("login") || lower.contains("cookies")) {
-            return "This video may require account access";
-        }
-        if (lower.contains("network") || lower.contains("timed out") || lower.contains("connection")) {
-            return "Check your internet connection and try again";
-        }
-        if (lower.contains("permission")) return "Storage permission is required on this device";
-        return "Try again or copy another public video link";
-    }
-
     private String extractUrlFromText(String text) {
         if (text == null || text.trim().isEmpty()) return null;
         Matcher matcher = URL_PATTERN.matcher(text);
@@ -614,8 +420,7 @@ public class MainActivity extends Activity {
             value = value.substring(0, value.length() - 1);
         }
         try {
-            Uri uri = Uri.parse(value);
-            if (uri.getHost() == null) return null;
+            if (Uri.parse(value).getHost() == null) return null;
         } catch (Throwable ignored) {
             return null;
         }
@@ -627,23 +432,17 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         setIntent(intent);
         String shared = extractUrlFromText(intent.getStringExtra(Intent.EXTRA_TEXT));
-        if (shared != null && !downloading) {
-            currentUrl = shared;
-            blackHoleView.hideStatus();
-            blackHoleView.setMode(BlackHoleView.Mode.READY);
-        }
+        if (shared != null && !busy) setDetectedUrl(shared);
     }
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         if (requestCode == STORAGE_PERMISSION_REQUEST) {
-            if (grantResults.length > 0 &&
-                    grantResults[0] == PackageManager.PERMISSION_GRANTED &&
-                    pendingPermissionUrl != null) {
+            if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED && pendingPermissionUrl != null) {
                 String url = pendingPermissionUrl;
                 pendingPermissionUrl = null;
-                startDownload(url);
+                resolveAndDownload(url);
             } else {
                 pendingPermissionUrl = null;
                 Toast.makeText(this, "Storage permission is needed on Android 9", Toast.LENGTH_LONG).show();
@@ -654,11 +453,23 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         mainHandler.removeCallbacksAndMessages(null);
-        downloadExecutor.shutdownNow();
+        worker.shutdownNow();
         super.onDestroy();
     }
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    private static final class ResolvedMedia {
+        final String url;
+        final String fileName;
+        final String label;
+
+        ResolvedMedia(String url, String fileName, String label) {
+            this.url = url;
+            this.fileName = fileName;
+            this.label = label;
+        }
     }
 }

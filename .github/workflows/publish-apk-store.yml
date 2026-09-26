@@ -1,0 +1,25 @@
+name: Publish APK to APK App Store
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: publish-apk-store-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: mazharmnzoor4227-beep/apk-app-store/.github/actions/publish-built-apks@main
+        with:
+          github-token: ${{ github.token }}
+          source-sha: ${{ github.sha }}
+          wait-seconds: '900'
